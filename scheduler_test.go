@@ -1,29 +1,44 @@
 package scheduler
 
 import (
-	"context"
+	"iter"
 	"testing"
 	"time"
 )
 
-type TestScheduler struct{}
-
-func (s *TestScheduler) Stream(ctx context.Context) <-chan any {
-	ch := make(chan any, 1)
-	return ch
+type TestScheduler struct {
+	v string
 }
 
-func (s *TestScheduler) Consume(ch <-chan any) {}
+func (s *TestScheduler) Stream() iter.Seq[string] {
+	return func(yield func(string) bool) {
+		data := []string{"Hello World"}
+		for _, v := range data {
+			if !yield(v) {
+				return
+			}
+		}
+	}
+}
+
+func (s *TestScheduler) Consume(v string) error {
+	s.v = v
+	return ErrAbort
+}
 
 func TestManager(t *testing.T) {
 	m := New()
-	m.Register(Every(1*time.Second), &TestScheduler{})
+	s := &TestScheduler{}
+	Register(m, Every(1*time.Second), s)
 
 	if len(m.routines) != 1 {
 		t.Error("Expect 1 routine to be registered")
 	}
 
-	go m.Run()
-	<-time.After(10 * time.Millisecond)
+	m.Run()
 	m.Stop()
+
+	if s.v != "Hello World" {
+		t.Errorf("Expect consuming string: %s got %s", "Hello World", s.v)
+	}
 }

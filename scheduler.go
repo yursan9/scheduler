@@ -5,70 +5,88 @@ package scheduler
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"iter"
+	"log/slog"
 	"sync"
 )
 
+var (
+	ErrAbort = errors.New("consumer abort")
+)
+
 // Routine is an interface for process that want to be scheduled.
-type Routine interface {
+type Routine[T any] interface {
 	// Stream return a channel and receive [context.Context] for cancellation.
 	// The method must be implemented by waiting on [context.Context.Done]
 	// before passing data to channel for scheduler cancellation.
 	//
 	// Example implementations:
-	//  func (s *scheduledRoutine) Stream(ctx context.Context) <-chan any {
-	//  	ch := make(chan any, 1)
-	//  	go func() {
-	//          arr := fetchItems()
-	//  		for _, v := range arr {
-	//  			select {
-	//  			case <-ctx.Done():
-	//  				close(ch)
-	//  				return
-	//  			default:
-	//  				ch <- v
-	//  			}
-	//  		}
-	//  		close(ch)
-	//  	}()
-	//
-	//  	return ch
-	//  }
-	Stream(context.Context) <-chan any
-	// Consume read from the channel returned by Stream()
-	//  func (s *scheduledRoutine) Consume(ch <-chan any) {
-	//  	for v := range ch {
-	//  		n := v.(string)
-	//  		fmt.Println("Hello,", n)
-	//  		time.Sleep(3 * time.Second)
+	//  func (s *scheduledRoutine) Stream() iter.Seq[string] {
+	//  	return func(yield func(E) bool) {
+	// 			for _, v := range s.fetch() {
+	//     			if !yield(v) {
+	//         			return
+	//     			}
+	// 			}
 	//  	}
 	//  }
-	Consume(<-chan any)
+	Stream() iter.Seq[T]
+	// Consume read from the channel returned by Stream()
+	//  func (s *scheduledRoutine) Consume(s string) error {
+	//  	n := v.(string)
+	//  	fmt.Println("Hello,", n)
+	//  	time.Sleep(3 * time.Second)
+	//		return nil
+	//  }
+	Consume(T) error
 }
 
-type scheduledRoutine struct {
+type scheduledRoutine[T any] struct {
 	timer   Timer
-	routine Routine
+	routine Routine[T]
 }
 
-type scheduleManager struct {
+func (sr *scheduledRoutine[T]) Execute(ctx context.Context) error {
+	for {
+		<-sr.timer()
+		for v := range sr.routine.Stream() {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				err := sr.routine.Consume(v)
+				slog.WarnContext(ctx, "error from consumer", "error", err)
+				if errors.Is(err, ErrAbort) {
+					return err
+				}
+			}
+		}
+	}
+}
+
+type ScheduledRoutine interface {
+	Execute(context.Context) error
+}
+
+type Manager struct {
 	wg       *sync.WaitGroup
-	routines []scheduledRoutine
+	routines []ScheduledRoutine
 	doneFunc context.CancelFunc
 	closeCh  chan struct{}
 }
 
 // New returns new schedule manager instance
-func New() *scheduleManager {
-	return &scheduleManager{
+func New() *Manager {
+	return &Manager{
 		wg:      new(sync.WaitGroup),
 		closeCh: make(chan struct{}),
 	}
 }
 
 // Register add Timer and Routine to manager for running
-func (m *scheduleManager) Register(timer Timer, r Routine) {
-	sr := scheduledRoutine{
+func Register[T any](m *Manager, timer Timer, r Routine[T]) {
+	sr := &scheduledRoutine[T]{
 		timer,
 		r,
 	}
@@ -76,36 +94,21 @@ func (m *scheduleManager) Register(timer Timer, r Routine) {
 }
 
 // Run start scheduler (will block on call)
-func (m *scheduleManager) Run() {
+func (m *Manager) Run() {
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	m.doneFunc = cancelFunc
 	for _, r := range m.routines {
 		m.wg.Add(1)
-		go worker(ctx, m.wg, r)
+		go func() {
+			r.Execute(ctx)
+			m.wg.Done()
+		}()
 	}
 
 	m.wg.Wait()
-	m.closeCh <- struct{}{}
 }
 
 // Stop will notify worker to stop processing scheduler (will block until finish)
-func (m *scheduleManager) Stop() {
+func (m *Manager) Stop() {
 	m.doneFunc()
-	<-m.closeCh
-}
-
-func worker(ctx context.Context, wg *sync.WaitGroup, sr scheduledRoutine) {
-	defer wg.Done()
-	for {
-		fmt.Println("Start Update Name scheduler")
-		<-sr.timer()
-
-		ch := sr.routine.Stream(ctx)
-		sr.routine.Consume(ch)
-
-		if ctx.Err() != nil {
-			fmt.Println("Exit from worker")
-			return
-		}
-	}
 }
